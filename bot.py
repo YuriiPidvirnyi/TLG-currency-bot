@@ -1,90 +1,88 @@
 import asyncio
 import os
 import logging
+from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from playwright.async_api import async_playwright
 
 logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ALLOWED_CHAT_ID = int(os.environ.get("ALLOWED_CHAT_ID", "0"))  # Marta's chat_id
+ALLOWED_CHAT_ID = int(os.environ.get("ALLOWED_CHAT_ID", "0"))
+OWNER_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID", "0"))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-
-async def take_privatbank_screenshot() -> str:
-    """Відкриває архів курсів Приватбанку і робить скріншот таблиці."""
-    path = "/tmp/privatbank_rates.png"
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox"]
-        )
-        page = await browser.new_page(viewport={"width": 1400, "height": 900})
-        await page.goto("https://privatbank.ua/obmin-valiut", wait_until="networkidle")
-
-        # Клікаємо "Архів"
-        await page.get_by_text("Архів", exact=False).first.click()
-        await page.wait_for_timeout(2000)
-
-        # Клікаємо "Таблиця"
-        try:
-            await page.get_by_text("Таблиця", exact=False).first.click()
-            await page.wait_for_timeout(2000)
-        except Exception:
-            pass
-
-        # Завантажуємо всі дані
-        while True:
-            try:
-                btn = page.get_by_text("Завантажити ще", exact=False).first
-                if await btn.is_visible():
-                    await btn.click()
-                    await page.wait_for_timeout(1500)
-                else:
-                    break
-            except Exception:
-                break
-
-        # Скріншот таблиці
-        await page.wait_for_timeout(1000)
-        await page.screenshot(path=path, full_page=True)
-        await browser.close()
-    return path
+SCREENSHOT_PATH = "/home/user/workspace/privatbank_rates.png"
 
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    if ALLOWED_CHAT_ID and message.chat.id != ALLOWED_CHAT_ID:
+    if message.chat.id not in [ALLOWED_CHAT_ID, OWNER_CHAT_ID]:
         await message.answer("Вибач, цей бот лише для особистого використання.")
         return
     await message.answer(
         "Привіт! 👋\n\n"
-        "Я надсилаю актуальні курси валют Приватбанку.\n\n"
+        "Надсилаю архів курсів валют Приватбанку.\n\n"
         "Команди:\n"
-        "/курси — отримати скрін курсів валют\n"
-        "/start — це повідомлення"
+        "/rates — останній збережений скрін 📊\n"
+        "/refresh — свіжий скрін просто зараз 🔄 (~1-2 хв)\n"
+        "/start — це повідомлення\n\n"
+        "🕐 Автооновлення: 06:00, 12:00, 15:00, 18:00, 21:00, 00:00"
     )
 
 
-@dp.message(Command("курси"))
+@dp.message(Command("rates"))
 async def cmd_rates(message: types.Message):
-    if ALLOWED_CHAT_ID and message.chat.id != ALLOWED_CHAT_ID:
+    if message.chat.id not in [ALLOWED_CHAT_ID, OWNER_CHAT_ID]:
         await message.answer("Вибач, цей бот лише для особистого використання.")
         return
-    wait_msg = await message.answer("⏳ Отримую курси валют, зачекай хвилинку...")
+
+    if not os.path.exists(SCREENSHOT_PATH):
+        await message.answer("⚠️ Скрін ще не готовий. Спробуй пізніше.")
+        return
+
+    # Час останнього оновлення
+    mtime = os.path.getmtime(SCREENSHOT_PATH)
+    updated = datetime.fromtimestamp(mtime).strftime("%d.%m.%Y %H:%M")
+
+    await message.answer_photo(
+        types.FSInputFile(SCREENSHOT_PATH),
+        caption=f"Архів курсів валют Приватбанку 📊\n🕐 Оновлено: {updated}"
+    )
+
+
+@dp.message(Command("refresh"))
+async def cmd_refresh(message: types.Message):
+    if message.chat.id not in [ALLOWED_CHAT_ID, OWNER_CHAT_ID]:
+        await message.answer("Вибач, цей бот лише для особистого використання.")
+        return
+
+    wait_msg = await message.answer("⏳ Роблю свіжий скрін... Зачекай ~1-2 хв.")
+
     try:
-        path = await take_privatbank_screenshot()
-        await bot.delete_message(message.chat.id, wait_msg.message_id)
-        await message.answer_photo(
-            types.FSInputFile(path),
-            caption="Курси валют Приватбанку (архів) 📊"
+        proc = await asyncio.create_subprocess_exec(
+            "python3", "/home/user/workspace/currency-bot/take_fresh_screenshot.py",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+
+        if proc.returncode != 0:
+            raise Exception(stderr.decode()[:300])
+
+        await bot.delete_message(message.chat.id, wait_msg.message_id)
+        mtime_str = __import__('datetime').datetime.now().strftime('%d.%m.%Y %H:%M')
+        await message.answer_photo(
+            types.FSInputFile(SCREENSHOT_PATH),
+            caption=f"Курси валют Приватбанку 📊 (архів)\n🔄 Щойно оновлено: {mtime_str}"
+        )
+    except asyncio.TimeoutError:
+        await wait_msg.edit_text("❌ Час очікування вичерпано. Спробуй ще раз.")
     except Exception as e:
-        logging.error(f"Error: {e}")
-        await message.answer("Помилка при отриманні курсів. Спробуй ще раз.")
+        logging.error(f"Refresh error: {e}", exc_info=True)
+        await wait_msg.edit_text(f"❌ Помилка: {str(e)[:200]}")
 
 
 async def main():
