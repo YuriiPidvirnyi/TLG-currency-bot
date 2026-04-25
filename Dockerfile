@@ -1,8 +1,10 @@
 FROM python:3.12-slim-bookworm
 
 RUN apt-get update && apt-get install -y \
-    wget curl \
+    wget curl tzdata \
     --no-install-recommends && rm -rf /var/lib/apt/lists/*
+
+ENV TZ=Europe/Kyiv
 
 WORKDIR /app
 
