@@ -114,9 +114,10 @@ async def cmd_refresh(message: types.Message):
         await _run_screenshot(progress_cb=on_progress)
         await bot.delete_message(message.chat.id, wait_msg.message_id)
         mtime_str = datetime.now().strftime("%d.%m.%Y %H:%M")
-        await message.answer_photo(
-            types.FSInputFile(SCREENSHOT_PATH),
-            caption=f"Курси валют Приватбанку 📊 (архів)\n🔄 Щойно оновлено: {mtime_str}",
+        # Send as document for full uncompressed quality (Telegram compresses photos)
+        await message.answer_document(
+            types.FSInputFile(SCREENSHOT_PATH, filename="privatbank_rates.png"),
+            caption=f"Курси валют Приватбанку 📊\n🔄 Щойно оновлено: {mtime_str}",
         )
     except asyncio.TimeoutError:
         await wait_msg.edit_text("❌ Час очікування вичерпано (>2 хв). Спробуй ще раз.")
