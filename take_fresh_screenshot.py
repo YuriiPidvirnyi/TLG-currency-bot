@@ -1,118 +1,147 @@
-import asyncio
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
-from PIL import Image
+"""Build the rates archive PNG from PrivatBank's public exchange-rate API.
+
+Replaces the previous Playwright-based scraper. Reasons:
+- privatbank.ua redesigned: /rates-archive now 301-redirects to /obmin-valiut
+  and the standalone archive table is gone from the public site.
+- Headless Chromium on Railway was unreliable (anti-bot, hangs, hydration races).
+- The API gives the same data instantly and can't be broken by HTML changes.
+"""
+import time
+import urllib.parse
+import urllib.request
+import json
+from datetime import datetime, timedelta
+from PIL import Image, ImageDraw, ImageFont
 
 OUTPUT_PATH = "/app/privatbank_rates.png"
-FULL_PAGE_TMP = "/tmp/privatbank_full.png"
-URL = "https://privatbank.ua/obmin-valiut"
+API_URL = "https://api.privatbank.ua/p24api/exchange_rates"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+DAYS = 14
+CURRENCIES = ("USD", "EUR")
+FONT_CANDIDATES = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+)
 
 
 def _step(n: int, total: int, desc: str) -> None:
     print(f"STEP:{n}:{total}:{desc}", flush=True)
 
 
-async def _click_text(page, text: str, timeout_ms: int = 20000) -> None:
-    """Real mouse click via Chrome DevTools Protocol — triggers all React handlers.
-    Tries an exact text match first, falls back to contains."""
-    try:
-        loc = page.get_by_text(text, exact=True).first
-        await loc.wait_for(state="visible", timeout=timeout_ms)
-        await loc.scroll_into_view_if_needed()
-        await loc.click(timeout=5000)
-    except PWTimeout:
-        loc = page.locator(f"text={text}").first
-        await loc.wait_for(state="visible", timeout=5000)
-        await loc.scroll_into_view_if_needed()
-        await loc.click(timeout=5000)
-
-
-async def main():
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--no-first-run",
-            ],
-        )
-        page = await browser.new_page(viewport={"width": 1280, "height": 900})
-
-        _step(1, 5, "Відкриваю сторінку Приватбанку")
-        await page.goto(URL, wait_until="domcontentloaded", timeout=30000)
-        # Let React hydrate so click handlers are attached
-        await page.wait_for_timeout(2500)
-
-        _step(2, 5, "Переходжу в Архів")
-        await _click_text(page, "Архів", timeout_ms=20000)
-        # Wait for the Архів view to render (Таблиця button is part of it)
-        await page.wait_for_timeout(1500)
-
-        _step(3, 5, "Вмикаю режим таблиці")
-        await _click_text(page, "Таблиця", timeout_ms=15000)
-        # Wait for actual table rows to appear — proves we are on the right tab
+def _fetch_with_retry(date_str: str, attempts: int = 4, backoff: float = 1.5) -> dict:
+    qs = urllib.parse.urlencode({"json": "", "date": date_str})
+    url = f"{API_URL}?{qs}"
+    last_err = None
+    for i in range(attempts):
         try:
-            await page.locator("table tr, [class*='table'] tr").first.wait_for(
-                state="visible", timeout=15000
-            )
-        except PWTimeout:
-            pass
-        await page.wait_for_timeout(500)
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status == 200:
+                    return json.loads(resp.read().decode())
+                last_err = f"HTTP {resp.status}"
+        except Exception as e:
+            last_err = str(e)
+        time.sleep(backoff * (i + 1))
+    raise RuntimeError(f"API failed for {date_str}: {last_err}")
 
-        _step(4, 5, "Завантажую всі записи")
-        for _ in range(10):
-            try:
-                more = page.get_by_text("Завантажити ще", exact=False).first
-                if not await more.is_visible(timeout=1500):
+
+def _collect_rows() -> list:
+    today = datetime.now().date()
+    rows = []
+    for i in range(DAYS):
+        d = today - timedelta(days=i)
+        ds = d.strftime("%d.%m.%Y")
+        try:
+            data = _fetch_with_retry(ds)
+        except Exception as e:
+            print(f"  warn: {ds}: {e}", flush=True)
+            continue
+        for cur in CURRENCIES:
+            for rate in data.get("exchangeRate", []):
+                if rate.get("currency") == cur and "saleRate" in rate:
+                    rows.append({
+                        "date": ds,
+                        "currency": f"UAH/{cur}",
+                        "buy": rate["purchaseRate"],
+                        "sell": rate["saleRate"],
+                    })
                     break
-                await more.scroll_into_view_if_needed()
-                await more.click(timeout=3000)
-                await page.wait_for_timeout(1000)
-            except PWTimeout:
-                break
+    return rows
 
-        await page.wait_for_timeout(500)
 
-        _step(5, 5, "Роблю скріншот та обробляю")
-        bbox = await page.evaluate("""(function () {
-            var selectors = [
-                '[class*="table_container"]',
-                '[class*="archive"]',
-                '[class*="table-macro"]',
-                'table'
-            ];
-            for (var sel of selectors) {
-                var els = document.querySelectorAll(sel);
-                for (var el of els) {
-                    var rect = el.getBoundingClientRect();
-                    var absY = rect.top + window.scrollY;
-                    if (rect.width > 300 && rect.height > 100) {
-                        return {
-                            x: Math.round(rect.left), y: Math.round(absY),
-                            w: Math.round(rect.width), h: Math.round(rect.height)
-                        };
-                    }
-                }
-            }
-            return null;
-        })()""")
+def _font(size: int):
+    for path in FONT_CANDIDATES:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
 
-        await page.screenshot(path=FULL_PAGE_TMP, full_page=True)
-        await browser.close()
 
-        img = Image.open(FULL_PAGE_TMP)
-        if bbox:
-            pad = 20
-            x1 = max(0, bbox["x"] - pad)
-            y1 = max(0, bbox["y"] - pad)
-            x2 = min(img.width, bbox["x"] + bbox["w"] + pad)
-            y2 = min(img.height, bbox["y"] + bbox["h"] + pad)
-            img = img.crop((x1, y1, x2, y2))
-        img.save(OUTPUT_PATH)
-        print(f"DONE:{OUTPUT_PATH}", flush=True)
+def _render(rows: list, output_path: str) -> None:
+    if not rows:
+        raise RuntimeError("No rates collected from API — nothing to render")
+
+    title_font = _font(24)
+    head_font = _font(18)
+    cell_font = _font(16)
+    sub_font = _font(13)
+
+    cols = [("Дата", 140), ("Валюта", 120), ("Купівля", 130), ("Продаж", 130)]
+    pad = 20
+    width = pad * 2 + sum(w for _, w in cols)
+    title_h = 40
+    sub_h = 22
+    head_h = 50
+    row_h = 40
+    height = pad + title_h + sub_h + 10 + head_h + row_h * len(rows) + pad
+
+    img = Image.new("RGB", (width, height), "white")
+    d = ImageDraw.Draw(img)
+
+    d.text((pad, pad), "Курси валют Приватбанку", fill="black", font=title_font)
+    generated = datetime.now().strftime("%d.%m.%Y %H:%M")
+    d.text((pad, pad + title_h), f"Архів за останні {DAYS} днів • згенеровано {generated}",
+           fill="#666", font=sub_font)
+
+    y = pad + title_h + sub_h + 10
+    d.rectangle([(pad, y), (width - pad, y + head_h)], fill="#f0f3f7")
+    x = pad + 12
+    for name, w in cols:
+        d.text((x, y + 14), name, fill="#1f2d3d", font=head_font)
+        x += w
+    d.line([(pad, y + head_h), (width - pad, y + head_h)], fill="#cbd5e0", width=1)
+
+    y += head_h
+    for i, row in enumerate(rows):
+        if i % 2 == 0:
+            d.rectangle([(pad, y), (width - pad, y + row_h)], fill="#fafbfc")
+        x = pad + 12
+        cells = [row["date"], row["currency"], f"{row['buy']:.4f}", f"{row['sell']:.4f}"]
+        for val, (_, w) in zip(cells, cols):
+            d.text((x, y + 11), val, fill="#222", font=cell_font)
+            x += w
+        d.line([(pad, y + row_h), (width - pad, y + row_h)], fill="#eef2f7", width=1)
+        y += row_h
+
+    d.rectangle([(0, 0), (width - 1, height - 1)], outline="#cbd5e0", width=1)
+    img.save(output_path)
+
+
+def main():
+    _step(1, 4, "Читаю API Приватбанку")
+    _step(2, 4, f"Збираю курси за {DAYS} днів")
+    rows = _collect_rows()
+
+    _step(3, 4, f"Малюю таблицю з {len(rows)} рядків")
+    _render(rows, OUTPUT_PATH)
+
+    _step(4, 4, "Зберігаю PNG")
+    print(f"DONE:{OUTPUT_PATH}", flush=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
