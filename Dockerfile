@@ -13,6 +13,5 @@ RUN playwright install-deps chromium
 
 COPY bot.py .
 COPY take_fresh_screenshot.py .
-COPY take_screenshot.py .
 
 CMD ["python", "bot.py"]

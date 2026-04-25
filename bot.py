@@ -89,6 +89,14 @@ async def cmd_refresh(message: types.Message):
         await wait_msg.edit_text(f"❌ Помилка: {str(e)[:200]}")
 
 
+async def _startup_screenshot():
+    try:
+        await _run_screenshot()
+        logging.info("Startup screenshot ready")
+    except Exception as e:
+        logging.error(f"Startup screenshot failed: {e}", exc_info=True)
+
+
 async def scheduled_update():
     logging.info("Scheduled screenshot update started")
     try:
@@ -106,6 +114,8 @@ async def scheduled_update():
 
 
 async def main():
+    asyncio.create_task(_startup_screenshot())
+
     try:
         scheduler = AsyncIOScheduler()
         for hour in [6, 12, 15, 18, 21, 0]:
