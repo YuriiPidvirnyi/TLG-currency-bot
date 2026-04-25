@@ -4,6 +4,7 @@ import logging
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logging.basicConfig(level=logging.INFO)
 
@@ -14,7 +15,8 @@ OWNER_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID", "0"))
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-SCREENSHOT_PATH = "/home/user/workspace/privatbank_rates.png"
+SCREENSHOT_PATH = "/app/privatbank_rates.png"
+SCREENSHOT_SCRIPT = "/app/take_fresh_screenshot.py"
 
 
 @dp.message(Command("start"))
@@ -43,7 +45,6 @@ async def cmd_rates(message: types.Message):
         await message.answer("⚠️ Скрін ще не готовий. Спробуй пізніше.")
         return
 
-    # Час останнього оновлення
     mtime = os.path.getmtime(SCREENSHOT_PATH)
     updated = datetime.fromtimestamp(mtime).strftime("%d.%m.%Y %H:%M")
 
@@ -51,6 +52,17 @@ async def cmd_rates(message: types.Message):
         types.FSInputFile(SCREENSHOT_PATH),
         caption=f"Архів курсів валют Приватбанку 📊\n🕐 Оновлено: {updated}"
     )
+
+
+async def _run_screenshot() -> None:
+    proc = await asyncio.create_subprocess_exec(
+        "python3", SCREENSHOT_SCRIPT,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+    if proc.returncode != 0:
+        raise Exception(stderr.decode()[:300])
 
 
 @dp.message(Command("refresh"))
@@ -62,18 +74,9 @@ async def cmd_refresh(message: types.Message):
     wait_msg = await message.answer("⏳ Роблю свіжий скрін... Зачекай ~1-2 хв.")
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "python3", "/home/user/workspace/currency-bot/take_fresh_screenshot.py",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
-
-        if proc.returncode != 0:
-            raise Exception(stderr.decode()[:300])
-
+        await _run_screenshot()
         await bot.delete_message(message.chat.id, wait_msg.message_id)
-        mtime_str = __import__('datetime').datetime.now().strftime('%d.%m.%Y %H:%M')
+        mtime_str = datetime.now().strftime('%d.%m.%Y %H:%M')
         await message.answer_photo(
             types.FSInputFile(SCREENSHOT_PATH),
             caption=f"Курси валют Приватбанку 📊 (архів)\n🔄 Щойно оновлено: {mtime_str}"
@@ -85,7 +88,27 @@ async def cmd_refresh(message: types.Message):
         await wait_msg.edit_text(f"❌ Помилка: {str(e)[:200]}")
 
 
+async def scheduled_update():
+    logging.info("Scheduled screenshot update started")
+    try:
+        await _run_screenshot()
+        mtime_str = datetime.now().strftime('%d.%m.%Y %H:%M')
+        caption = f"Курси валют Приватбанку 📊 (архів)\n🕐 Автооновлення: {mtime_str}"
+        for chat_id in {ALLOWED_CHAT_ID, OWNER_CHAT_ID}:
+            if chat_id:
+                try:
+                    await bot.send_photo(chat_id, types.FSInputFile(SCREENSHOT_PATH), caption=caption)
+                except Exception as e:
+                    logging.error(f"Failed to send scheduled update to {chat_id}: {e}")
+    except Exception as e:
+        logging.error(f"Scheduled update error: {e}", exc_info=True)
+
+
 async def main():
+    scheduler = AsyncIOScheduler()
+    for hour in [6, 12, 15, 18, 21, 0]:
+        scheduler.add_job(scheduled_update, "cron", hour=hour, minute=0)
+    scheduler.start()
     await dp.start_polling(bot)
 
 
