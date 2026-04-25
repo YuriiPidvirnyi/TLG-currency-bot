@@ -13,6 +13,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
+from aiogram.types import BotCommand
 
 logging.basicConfig(level=logging.INFO)
 
@@ -213,7 +214,19 @@ async def cmd_year(message: types.Message):
     await _reply_archive(message, "year")
 
 
+async def _set_commands_menu():
+    await bot.set_my_commands([
+        BotCommand(command="now", description="Поточний курс (готівка + безготівка)"),
+        BotCommand(command="today", description="Зміни курсу за сьогодні"),
+        BotCommand(command="week", description="Архів за тиждень"),
+        BotCommand(command="month", description="Архів за місяць"),
+        BotCommand(command="year", description="Архів за рік"),
+        BotCommand(command="start", description="Список команд"),
+    ])
+
+
 async def main():
+    await _set_commands_menu()
     await dp.start_polling(bot, drop_pending_updates=True)
 
 
