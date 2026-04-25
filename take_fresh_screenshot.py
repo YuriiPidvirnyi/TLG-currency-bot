@@ -30,25 +30,19 @@ async def main():
             wait_until="domcontentloaded",
             timeout=30000,
         )
-        await page.wait_for_timeout(2000)
+        # Wait until the "Архів" tab is rendered by the SPA before clicking
+        await page.wait_for_selector("text=Архів", timeout=20000)
 
         _step(2, 5, "Переходжу в Архів")
-        await page.evaluate("""
-            Array.from(document.querySelectorAll('*')).forEach(el => {
-                if (el.children.length === 0 && el.innerText && el.innerText.trim() === 'Архів')
-                    el.dispatchEvent(new MouseEvent('click', {bubbles: true}));
-            });
-        """)
-        await page.wait_for_timeout(1500)
+        await page.click("text=Архів")
+        # Wait for the "Таблиця" button that appears only inside the Архів section
+        await page.wait_for_selector("text=Таблиця", timeout=15000)
 
         _step(3, 5, "Вмикаю режим таблиці")
-        await page.evaluate("""
-            Array.from(document.querySelectorAll('*')).forEach(el => {
-                if (el.children.length === 0 && el.innerText && el.innerText.trim() === 'Таблиця')
-                    el.dispatchEvent(new MouseEvent('click', {bubbles: true}));
-            });
-        """)
-        await page.wait_for_timeout(1500)
+        await page.click("text=Таблиця")
+        # Wait for actual table rows to appear
+        await page.wait_for_selector("table tr, [class*='table'] tr", timeout=15000)
+        await page.wait_for_timeout(500)
 
         _step(4, 5, "Завантажую всі записи")
         for _ in range(10):
@@ -68,7 +62,7 @@ async def main():
                 break
             await page.wait_for_timeout(1000)
 
-        await page.wait_for_timeout(500)
+        await page.wait_for_timeout(300)
 
         _step(5, 5, "Роблю скріншот та обробляю")
         bbox = await page.evaluate("""
