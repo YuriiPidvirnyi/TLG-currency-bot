@@ -31,7 +31,6 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 ARCHIVE_ENDPOINT = "https://privatbank.ua/rates/get-archive"
-PUBINFO_URL = "https://api.privatbank.ua/p24api/pubinfo"
 DEFAULT_CURRENCY = "USD"
 PERIOD_LABELS = {
     "day": "за день",
@@ -62,22 +61,6 @@ def _http_get(url: str, headers: dict | None = None, attempts: int = 3) -> str:
             last = str(e)
         time.sleep(1.0 * (i + 1))
     raise RuntimeError(last or "unknown error")
-
-
-def _fetch_live(currency: str = DEFAULT_CURRENCY) -> dict:
-    out = {}
-    for cid, label in ((5, "безготівка"), (11, "готівка")):
-        try:
-            text = _http_get(f"{PUBINFO_URL}?json&exchange&coursid={cid}", attempts=2)
-            data = json.loads(text)
-        except Exception as e:
-            logging.warning("pubinfo coursid=%s: %s", cid, e)
-            continue
-        for item in data:
-            if item.get("ccy") == currency:
-                out[label] = (float(item["buy"]), float(item["sale"]))
-                break
-    return out
 
 
 _TR_RE = re.compile(r"<tr>(.*?)</tr>", re.DOTALL)
@@ -114,18 +97,6 @@ def _fetch_archive(period: str, currency: str = DEFAULT_CURRENCY) -> list:
             rows.append((date, t, cur, buy_f, sell_f))
     rows.reverse()  # newest first
     return rows
-
-
-def _format_live(live: dict, currency: str) -> str:
-    if not live:
-        return "❌ Не вдалось отримати поточний курс."
-    ts = datetime.now().strftime("%d.%m.%Y %H:%M")
-    lines = [f"💵 *{currency}/UAH • поточний курс*", f"_{ts}_", ""]
-    for label, (buy, sell) in live.items():
-        lines.append(f"*{label.capitalize()}:*  `{buy:.4f}` / `{sell:.4f}`")
-    lines.append("")
-    lines.append("_Купівля / Продаж_")
-    return "\n".join(lines)
 
 
 _FONT_REG = (
@@ -215,10 +186,7 @@ async def cmd_start(message: types.Message):
         return
     await message.answer(
         "Привіт! 👋\n\n"
-        f"Курси *{DEFAULT_CURRENCY}* від Приватбанку.\n\n"
-        "*Поточний курс*\n"
-        "/now — готівка + безготівка просто зараз\n\n"
-        "*Архів* (готівковий курс банку)\n"
+        f"Архів готівкового курсу *{DEFAULT_CURRENCY}* від Приватбанку:\n\n"
         "/today — всі сьогоднішні зміни курсу\n"
         "/week — за останній тиждень\n"
         "/month — за останній місяць\n"
@@ -255,19 +223,6 @@ async def _reply_archive(message: types.Message, period: str, today_only: bool =
         await wait.edit_text(f"❌ Помилка: `{str(e)[:200]}`")
 
 
-@dp.message(Command("now"))
-async def cmd_now(message: types.Message):
-    if not _is_authorized(message):
-        return
-    wait = await message.answer("⏳ Запитую курс...")
-    try:
-        live = await asyncio.to_thread(_fetch_live)
-        await wait.edit_text(_format_live(live, DEFAULT_CURRENCY))
-    except Exception as e:
-        logging.exception("cmd_now failed")
-        await wait.edit_text(f"❌ Помилка: `{str(e)[:200]}`")
-
-
 @dp.message(Command("today"))
 async def cmd_today(message: types.Message):
     # Pull from week so all intra-day records show, then filter to today
@@ -291,7 +246,6 @@ async def cmd_year(message: types.Message):
 
 async def _set_commands_menu():
     await bot.set_my_commands([
-        BotCommand(command="now", description="Поточний курс (готівка + безготівка)"),
         BotCommand(command="today", description="Зміни курсу за сьогодні"),
         BotCommand(command="week", description="Архів за тиждень"),
         BotCommand(command="month", description="Архів за місяць"),
