@@ -9,8 +9,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ALLOWED_CHAT_ID = int(os.environ.get("ALLOWED_CHAT_ID", "0"))
-OWNER_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID", "0"))
+# Guard against empty-string env vars (Railway can set vars to "")
+ALLOWED_CHAT_ID = int(os.environ.get("ALLOWED_CHAT_ID") or "0")
+OWNER_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID") or "0")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -105,11 +106,17 @@ async def scheduled_update():
 
 
 async def main():
-    scheduler = AsyncIOScheduler()
-    for hour in [6, 12, 15, 18, 21, 0]:
-        scheduler.add_job(scheduled_update, "cron", hour=hour, minute=0)
-    scheduler.start()
-    await dp.start_polling(bot)
+    try:
+        scheduler = AsyncIOScheduler()
+        for hour in [6, 12, 15, 18, 21, 0]:
+            scheduler.add_job(scheduled_update, "cron", hour=hour, minute=0)
+        scheduler.start()
+        logging.info("Scheduler started successfully")
+    except Exception as e:
+        # Scheduler failure must not prevent the bot from starting
+        logging.error(f"Scheduler failed to start: {e}", exc_info=True)
+
+    await dp.start_polling(bot, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
