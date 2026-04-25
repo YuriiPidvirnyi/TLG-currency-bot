@@ -1,7 +1,11 @@
 """Build the rates archive PNG from PrivatBank's public exchange-rate API.
 
-- /pubinfo?coursid=11 (cash, fallback 5) gives the current live rate.
-- /exchange_rates?date=DD.MM.YYYY gives end-of-day rates for history.
+Live "Поточний курс" section shows both:
+- Безготівка (coursid=5) — same number you see on privatbank.ua/obmin-valiut
+- Готівка (coursid=11) — physical-branch cash exchange
+
+Archive section shows daily closing rates from /exchange_rates.
+Currently USD-only; expand CURRENCIES to add more.
 """
 import time
 import urllib.parse
@@ -18,7 +22,11 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 DAYS = 30
-CURRENCIES = ("USD", "EUR")
+CURRENCIES = ("USD",)
+LIVE_SOURCES = (
+    (5, "безготівка"),
+    (11, "готівка"),
+)
 FONT_CANDIDATES = (
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -44,22 +52,28 @@ def _get_json(url: str, attempts: int = 4, backoff: float = 1.5) -> object:
     raise RuntimeError(last or "unknown error")
 
 
-def _fetch_current() -> dict:
-    """Live rates. Try cash (coursid=11), fall back to non-cash (coursid=5)."""
-    for cid in (11, 5):
+def _fetch_live() -> list:
+    """Returns list of {kind, currency, buy, sell} for each (coursid, currency)."""
+    rows = []
+    for cid, label in LIVE_SOURCES:
         try:
-            data = _get_json(f"{PUBINFO_URL}?json&exchange&coursid={cid}", attempts=2)
-            if isinstance(data, list) and data:
-                rates = {}
-                for item in data:
-                    cur = item.get("ccy")
-                    if cur in CURRENCIES:
-                        rates[cur] = {"buy": float(item["buy"]), "sell": float(item["sale"])}
-                if rates:
-                    return rates
+            data = _get_json(f"{PUBINFO_URL}?json&exchange&coursid={cid}", attempts=3)
         except Exception as e:
             print(f"  warn: pubinfo coursid={cid}: {e}", flush=True)
-    return {}
+            continue
+        if not isinstance(data, list):
+            continue
+        for cur in CURRENCIES:
+            for item in data:
+                if item.get("ccy") == cur:
+                    rows.append({
+                        "kind": label,
+                        "currency": cur,
+                        "buy": float(item["buy"]),
+                        "sell": float(item["sale"]),
+                    })
+                    break
+    return rows
 
 
 def _fetch_archive() -> list:
@@ -79,7 +93,7 @@ def _fetch_archive() -> list:
                 if rate.get("currency") == cur and "saleRate" in rate:
                     rows.append({
                         "date": ds,
-                        "currency": f"UAH/{cur}",
+                        "currency": cur,
                         "buy": float(rate["purchaseRate"]),
                         "sell": float(rate["saleRate"]),
                     })
@@ -96,8 +110,8 @@ def _font(size: int):
     return ImageFont.load_default()
 
 
-def _render(current: dict, archive: list, output_path: str) -> None:
-    if not current and not archive:
+def _render(live: list, archive: list, output_path: str) -> None:
+    if not live and not archive:
         raise RuntimeError("API повернуло порожньо — нема даних для відображення")
 
     title_font = _font(24)
@@ -106,9 +120,10 @@ def _render(current: dict, archive: list, output_path: str) -> None:
     sub_font = _font(13)
     section_font = _font(17)
 
-    cols = [("Дата / Час", 160), ("Валюта", 110), ("Купівля", 130), ("Продаж", 130)]
     pad = 20
-    width = pad * 2 + sum(w for _, w in cols)
+    cols_live = [("Тип", 150), ("Валюта", 90), ("Купівля", 130), ("Продаж", 150)]
+    cols_arch = [("Дата", 150), ("Валюта", 90), ("Купівля", 130), ("Продаж", 150)]
+    width = pad * 2 + sum(w for _, w in cols_live)
     title_h = 40
     sub_h = 22
     section_h = 32
@@ -116,12 +131,10 @@ def _render(current: dict, archive: list, output_path: str) -> None:
     row_h = 40
     now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
 
-    current_rows = len(current)
-    archive_rows = len(archive)
     height = (
         pad + title_h + sub_h + 12
-        + (section_h + row_h * current_rows + 12 if current_rows else 0)
-        + section_h + head_h + row_h * archive_rows
+        + (section_h + head_h + row_h * len(live) + 16 if live else 0)
+        + (section_h + head_h + row_h * len(archive) if archive else 0)
         + pad
     )
 
@@ -133,49 +146,56 @@ def _render(current: dict, archive: list, output_path: str) -> None:
 
     y = pad + title_h + sub_h + 12
 
-    if current_rows:
+    if live:
         d.rectangle([(pad, y), (width - pad, y + section_h)], fill="#e7f3ff")
         d.text((pad + 12, y + 7), f"Поточний курс • {now_str}",
                fill="#0a5cff", font=section_font)
         y += section_h
-        for i, cur in enumerate(CURRENCIES):
-            if cur not in current:
-                continue
-            r = current[cur]
+
+        d.rectangle([(pad, y), (width - pad, y + head_h)], fill="#f7fbff")
+        x = pad + 12
+        for name, w in cols_live:
+            d.text((x, y + 14), name, fill="#0a2540", font=head_font)
+            x += w
+        d.line([(pad, y + head_h), (width - pad, y + head_h)], fill="#cbd5e0", width=1)
+        y += head_h
+
+        for i, row in enumerate(live):
             if i % 2 == 0:
-                d.rectangle([(pad, y), (width - pad, y + row_h)], fill="#f7fbff")
+                d.rectangle([(pad, y), (width - pad, y + row_h)], fill="#fafbfc")
             x = pad + 12
-            cells = [now_str, f"UAH/{cur}", f"{r['buy']:.4f}", f"{r['sell']:.4f}"]
-            for val, (_, w) in zip(cells, cols):
+            cells = [row["kind"], row["currency"], f"{row['buy']:.4f}", f"{row['sell']:.4f}"]
+            for val, (_, w) in zip(cells, cols_live):
                 d.text((x, y + 11), val, fill="#0a2540", font=cell_font)
                 x += w
             d.line([(pad, y + row_h), (width - pad, y + row_h)], fill="#d6e8ff", width=1)
             y += row_h
-        y += 12
+        y += 16
 
-    d.rectangle([(pad, y), (width - pad, y + section_h)], fill="#f0f3f7")
-    d.text((pad + 12, y + 7), f"Архів за останні {DAYS} днів",
-           fill="#1f2d3d", font=section_font)
-    y += section_h
+    if archive:
+        d.rectangle([(pad, y), (width - pad, y + section_h)], fill="#f0f3f7")
+        d.text((pad + 12, y + 7), f"Архів за останні {DAYS} днів",
+               fill="#1f2d3d", font=section_font)
+        y += section_h
 
-    d.rectangle([(pad, y), (width - pad, y + head_h)], fill="#fafbfc")
-    x = pad + 12
-    for name, w in cols:
-        d.text((x, y + 14), name, fill="#1f2d3d", font=head_font)
-        x += w
-    d.line([(pad, y + head_h), (width - pad, y + head_h)], fill="#cbd5e0", width=1)
-    y += head_h
-
-    for i, row in enumerate(archive):
-        if i % 2 == 0:
-            d.rectangle([(pad, y), (width - pad, y + row_h)], fill="#fafbfc")
+        d.rectangle([(pad, y), (width - pad, y + head_h)], fill="#fafbfc")
         x = pad + 12
-        cells = [row["date"], row["currency"], f"{row['buy']:.4f}", f"{row['sell']:.4f}"]
-        for val, (_, w) in zip(cells, cols):
-            d.text((x, y + 11), val, fill="#222", font=cell_font)
+        for name, w in cols_arch:
+            d.text((x, y + 14), name, fill="#1f2d3d", font=head_font)
             x += w
-        d.line([(pad, y + row_h), (width - pad, y + row_h)], fill="#eef2f7", width=1)
-        y += row_h
+        d.line([(pad, y + head_h), (width - pad, y + head_h)], fill="#cbd5e0", width=1)
+        y += head_h
+
+        for i, row in enumerate(archive):
+            if i % 2 == 0:
+                d.rectangle([(pad, y), (width - pad, y + row_h)], fill="#fafbfc")
+            x = pad + 12
+            cells = [row["date"], row["currency"], f"{row['buy']:.4f}", f"{row['sell']:.4f}"]
+            for val, (_, w) in zip(cells, cols_arch):
+                d.text((x, y + 11), val, fill="#222", font=cell_font)
+                x += w
+            d.line([(pad, y + row_h), (width - pad, y + row_h)], fill="#eef2f7", width=1)
+            y += row_h
 
     d.rectangle([(0, 0), (width - 1, height - 1)], outline="#cbd5e0", width=1)
     img.save(output_path)
@@ -183,13 +203,13 @@ def _render(current: dict, archive: list, output_path: str) -> None:
 
 def main():
     _step(1, 4, "Тягну поточний курс")
-    current = _fetch_current()
+    live = _fetch_live()
 
     _step(2, 4, f"Тягну архів за {DAYS} днів")
     archive = _fetch_archive()
 
-    _step(3, 4, f"Малюю таблицю ({len(current)} live + {len(archive)} архів)")
-    _render(current, archive, OUTPUT_PATH)
+    _step(3, 4, f"Малюю таблицю ({len(live)} live + {len(archive)} архів)")
+    _render(live, archive, OUTPUT_PATH)
 
     _step(4, 4, "Зберігаю PNG")
     print(f"DONE:{OUTPUT_PATH}", flush=True)
