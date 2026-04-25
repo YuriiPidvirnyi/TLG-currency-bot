@@ -102,7 +102,13 @@ def _fetch_archive(period: str, currency: str = DEFAULT_CURRENCY) -> list:
     for tr in _TR_RE.findall(html):
         tds = [_TAG_RE.sub("", unescape(td)).strip() for td in _TD_RE.findall(tr)]
         if len(tds) == 5:
-            rows.append(tuple(tds))
+            date, t, cur, buy, sell = tds
+            try:
+                buy_f = float(buy.replace(",", "."))
+                sell_f = float(sell.replace(",", "."))
+            except ValueError:
+                continue
+            rows.append((date, t, cur, buy_f, sell_f))
     rows.reverse()  # newest first
     return rows
 
@@ -119,21 +125,21 @@ def _format_live(live: dict, currency: str) -> str:
     return "\n".join(lines)
 
 
-def _format_archive(rows: list, period: str, currency: str) -> str:
+def _format_archive(rows: list, label: str, currency: str) -> str:
     if not rows:
-        return f"❌ Архів порожній для періоду {PERIOD_LABELS.get(period, period)}."
+        return f"❌ Архів порожній ({label})."
     total = len(rows)
     cropped = rows[:MAX_TG_ROWS]
     lines = [
-        f"📊 *Архів {currency}/UAH • {PERIOD_LABELS.get(period, period)}*",
+        f"📊 *Архів {currency}/UAH • {label}*",
         f"_Записів: {total}{' (показано перші ' + str(len(cropped)) + ')' if total > len(cropped) else ''}_",
         "",
         "```",
-        f"{'Дата':<11} {'Час':<8} {'Купівля':>9} {'Продаж':>13}",
-        "─" * 45,
+        f"{'Дата':<11} {'Час':<9} {'Купівля':>8}  {'Продаж':>8}",
+        "─" * 41,
     ]
     for date, t, _cur, buy, sell in cropped:
-        lines.append(f"{date:<11} {t:<8} {buy:>9} {sell:>13}")
+        lines.append(f"{date:<11} {t:<9} {buy:>8.4f}  {sell:>8.4f}")
     lines.append("```")
     return "\n".join(lines)
 
@@ -146,23 +152,28 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "Привіт! 👋\n\n"
         f"Курси *{DEFAULT_CURRENCY}* від Приватбанку.\n\n"
-        "Команди:\n"
-        "/now — поточний курс (готівка + безготівка)\n"
-        "/today — архів за день\n"
-        "/week — архів за тиждень\n"
-        "/month — архів за місяць\n"
-        "/year — архів за рік (макс. 60 рядків)\n"
+        "*Поточний курс*\n"
+        "/now — готівка + безготівка просто зараз\n\n"
+        "*Архів* (готівковий курс банку)\n"
+        "/today — всі сьогоднішні зміни курсу\n"
+        "/week — за останній тиждень\n"
+        "/month — за останній місяць\n"
+        "/year — за рік (макс. 60 останніх записів)\n\n"
         "/start — це повідомлення"
     )
 
 
-async def _reply_archive(message: types.Message, period: str):
+async def _reply_archive(message: types.Message, period: str, today_only: bool = False):
     if not _is_authorized(message):
         return
-    wait = await message.answer(f"⏳ Тягну архів {PERIOD_LABELS[period]}...")
+    label = "за сьогодні" if today_only else PERIOD_LABELS[period]
+    wait = await message.answer(f"⏳ Тягну архів {label}...")
     try:
         rows = await asyncio.to_thread(_fetch_archive, period)
-        await wait.edit_text(_format_archive(rows, period, DEFAULT_CURRENCY))
+        if today_only:
+            today = datetime.now().strftime("%d-%m-%Y")
+            rows = [r for r in rows if r[0] == today]
+        await wait.edit_text(_format_archive(rows, label, DEFAULT_CURRENCY))
     except Exception as e:
         logging.exception("archive %s failed", period)
         await wait.edit_text(f"❌ Помилка: `{str(e)[:200]}`")
@@ -183,7 +194,8 @@ async def cmd_now(message: types.Message):
 
 @dp.message(Command("today"))
 async def cmd_today(message: types.Message):
-    await _reply_archive(message, "day")
+    # Pull from week so all intra-day records show, then filter to today
+    await _reply_archive(message, "week", today_only=True)
 
 
 @dp.message(Command("week"))
