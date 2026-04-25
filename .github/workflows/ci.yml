@@ -15,7 +15,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Compile-check Python sources
-        run: python -m py_compile bot.py take_fresh_screenshot.py
+        run: python -m py_compile bot.py
 
   docker-build:
     name: Docker image build

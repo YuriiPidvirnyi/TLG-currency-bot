@@ -1,11 +1,16 @@
 import asyncio
-import contextlib
-import os
+import json
 import logging
-from datetime import datetime
+import os
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta
+
 from aiogram import Bot, Dispatcher, types
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logging.basicConfig(level=logging.INFO)
 
@@ -13,155 +18,161 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ALLOWED_CHAT_ID = int(os.environ.get("ALLOWED_CHAT_ID") or "0")
 OWNER_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID") or "0")
 
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
 dp = Dispatcher()
 
-SCREENSHOT_PATH = "/app/privatbank_rates.png"
-SCREENSHOT_SCRIPT = "/app/take_fresh_screenshot.py"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+ARCHIVE_URL = "https://api.privatbank.ua/p24api/exchange_rates"
+PUBINFO_URL = "https://api.privatbank.ua/p24api/pubinfo"
+HISTORY_DAYS = 30
+CURRENCY = "USD"
 
 
-def _progress_bar(step: int, total: int, desc: str) -> str:
-    filled = round(step / total * 10)
-    bar = "█" * filled + "░" * (10 - filled)
-    pct = round(step / total * 100)
-    return f"🔄 Оновлюю курси...\n\n{bar}  {pct}%\n📍 {desc}"
+def _is_authorized(message: types.Message) -> bool:
+    return message.chat.id in (ALLOWED_CHAT_ID, OWNER_CHAT_ID)
 
 
-async def _run_screenshot(progress_cb=None) -> None:
-    proc = await asyncio.create_subprocess_exec(
-        "python3", SCREENSHOT_SCRIPT,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+def _get_json(url: str, attempts: int = 3, backoff: float = 1.0) -> object:
+    last = None
+    for i in range(attempts):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status == 200:
+                    return json.loads(resp.read().decode())
+                last = f"HTTP {resp.status}"
+        except Exception as e:
+            last = str(e)
+        time.sleep(backoff * (i + 1))
+    raise RuntimeError(last or "unknown error")
 
-    async def _read_stdout():
-        async for raw in proc.stdout:
-            text = raw.decode().strip()
-            if progress_cb and text.startswith("STEP:"):
-                parts = text.split(":", 3)
-                if len(parts) == 4:
-                    with contextlib.suppress(Exception):
-                        await progress_cb(int(parts[1]), int(parts[2]), parts[3])
 
-    try:
-        _, stderr_bytes = await asyncio.wait_for(
-            asyncio.gather(_read_stdout(), proc.stderr.read()),
-            timeout=120,
-        )
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        raise
+def _fetch_live() -> dict:
+    """Returns {'безготівка': (buy, sell), 'готівка': (buy, sell)} for USD."""
+    out = {}
+    for cid, label in ((5, "безготівка"), (11, "готівка")):
+        try:
+            data = _get_json(f"{PUBINFO_URL}?json&exchange&coursid={cid}", attempts=2)
+        except Exception as e:
+            logging.warning("pubinfo coursid=%s: %s", cid, e)
+            continue
+        if not isinstance(data, list):
+            continue
+        for item in data:
+            if item.get("ccy") == CURRENCY:
+                out[label] = (float(item["buy"]), float(item["sale"]))
+                break
+    return out
 
-    await proc.wait()
-    if proc.returncode != 0:
-        err = stderr_bytes.decode().strip()
-        # Show last 5 lines — that's where the actual exception type/message lives
-        last = "\n".join(err.splitlines()[-5:])
-        raise Exception(last)
+
+def _fetch_history(days: int) -> list:
+    today = datetime.now().date()
+    rows = []
+    for i in range(days):
+        d = today - timedelta(days=i)
+        ds = d.strftime("%d.%m.%Y")
+        qs = urllib.parse.urlencode({"json": "", "date": ds})
+        try:
+            data = _get_json(f"{ARCHIVE_URL}?{qs}")
+        except Exception as e:
+            logging.warning("archive %s: %s", ds, e)
+            continue
+        for rate in data.get("exchangeRate", []):
+            if rate.get("currency") == CURRENCY and "saleRate" in rate:
+                rows.append((ds, float(rate["purchaseRate"]), float(rate["saleRate"])))
+                break
+    return rows
+
+
+def _format_live(live: dict) -> str:
+    if not live:
+        return "❌ Не вдалось отримати поточний курс. Спробуй пізніше."
+    ts = datetime.now().strftime("%d.%m.%Y %H:%M")
+    lines = [f"💵 *{CURRENCY}/UAH • поточний курс*", f"_{ts}_", ""]
+    for label, (buy, sell) in live.items():
+        lines.append(f"*{label.capitalize()}:*  `{buy:.4f}` / `{sell:.4f}`")
+    lines.append("")
+    lines.append("_Купівля / Продаж_")
+    return "\n".join(lines)
+
+
+def _format_history(rows: list) -> str:
+    if not rows:
+        return "❌ Архів порожній. Спробуй пізніше."
+    lines = [f"📊 *{CURRENCY}/UAH • архів за {len(rows)} днів*", ""]
+    lines.append("```")
+    lines.append(f"{'Дата':<11} {'Купівля':>9}  {'Продаж':>9}")
+    lines.append("─" * 32)
+    for date, buy, sell in rows:
+        lines.append(f"{date:<11} {buy:>9.4f}  {sell:>9.4f}")
+    lines.append("```")
+    lines.append("_Закриваючий курс банку за день (безготівковий)_")
+    return "\n".join(lines)
 
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    if message.chat.id not in [ALLOWED_CHAT_ID, OWNER_CHAT_ID]:
+    if not _is_authorized(message):
         await message.answer("Вибач, цей бот лише для особистого використання.")
         return
     await message.answer(
         "Привіт! 👋\n\n"
-        "Надсилаю архів курсів валют Приватбанку.\n\n"
+        f"Курси *{CURRENCY}* від Приватбанку.\n\n"
         "Команди:\n"
-        "/rates — останній збережений скрін 📊\n"
-        "/refresh — свіжий скрін просто зараз 🔄 (~10 сек)\n"
-        "/start — це повідомлення\n\n"
-        "🕐 Автооновлення: 06:00, 12:00, 15:00, 18:00, 21:00, 00:00"
+        "/now — поточний курс (готівка + безготівка)\n"
+        f"/history — архів за {HISTORY_DAYS} днів\n"
+        "/rates — поточний + архів одним повідомленням\n"
+        "/start — це повідомлення"
     )
+
+
+@dp.message(Command("now"))
+async def cmd_now(message: types.Message):
+    if not _is_authorized(message):
+        return
+    wait = await message.answer("⏳ Запитую курс...")
+    try:
+        live = await asyncio.to_thread(_fetch_live)
+        await wait.edit_text(_format_live(live))
+    except Exception as e:
+        logging.exception("cmd_now failed")
+        await wait.edit_text(f"❌ Помилка: `{str(e)[:200]}`")
+
+
+@dp.message(Command("history"))
+async def cmd_history(message: types.Message):
+    if not _is_authorized(message):
+        return
+    wait = await message.answer(f"⏳ Збираю архів за {HISTORY_DAYS} днів...")
+    try:
+        rows = await asyncio.to_thread(_fetch_history, HISTORY_DAYS)
+        await wait.edit_text(_format_history(rows))
+    except Exception as e:
+        logging.exception("cmd_history failed")
+        await wait.edit_text(f"❌ Помилка: `{str(e)[:200]}`")
 
 
 @dp.message(Command("rates"))
 async def cmd_rates(message: types.Message):
-    if message.chat.id not in [ALLOWED_CHAT_ID, OWNER_CHAT_ID]:
-        await message.answer("Вибач, цей бот лише для особистого використання.")
+    if not _is_authorized(message):
         return
-
-    if not os.path.exists(SCREENSHOT_PATH):
-        await message.answer("⚠️ Скрін ще не готовий. Спробуй пізніше.")
-        return
-
-    mtime = os.path.getmtime(SCREENSHOT_PATH)
-    updated = datetime.fromtimestamp(mtime).strftime("%d.%m.%Y %H:%M")
-
-    await message.answer_photo(
-        types.FSInputFile(SCREENSHOT_PATH),
-        caption=f"Архів курсів валют Приватбанку 📊\n🕐 Оновлено: {updated}",
-    )
-
-
-@dp.message(Command("refresh"))
-async def cmd_refresh(message: types.Message):
-    if message.chat.id not in [ALLOWED_CHAT_ID, OWNER_CHAT_ID]:
-        await message.answer("Вибач, цей бот лише для особистого використання.")
-        return
-
-    wait_msg = await message.answer(
-        "🔄 Оновлюю курси...\n\n░░░░░░░░░░  0%\n📍 Запускаю..."
-    )
-
-    async def on_progress(step: int, total: int, desc: str) -> None:
-        with contextlib.suppress(Exception):
-            await wait_msg.edit_text(_progress_bar(step, total, desc))
-
+    wait = await message.answer("⏳ Збираю курс і архів...")
     try:
-        await _run_screenshot(progress_cb=on_progress)
-        await bot.delete_message(message.chat.id, wait_msg.message_id)
-        mtime_str = datetime.now().strftime("%d.%m.%Y %H:%M")
-        # Send as document for full uncompressed quality (Telegram compresses photos)
-        await message.answer_document(
-            types.FSInputFile(SCREENSHOT_PATH, filename="privatbank_rates.png"),
-            caption=f"Курси валют Приватбанку 📊\n🔄 Щойно оновлено: {mtime_str}",
+        live, rows = await asyncio.gather(
+            asyncio.to_thread(_fetch_live),
+            asyncio.to_thread(_fetch_history, HISTORY_DAYS),
         )
-    except asyncio.TimeoutError:
-        await wait_msg.edit_text("❌ Час очікування вичерпано (>2 хв). Спробуй ще раз.")
+        text = _format_live(live) + "\n\n" + _format_history(rows)
+        await wait.edit_text(text)
     except Exception as e:
-        logging.error("Refresh error: %s", e, exc_info=True)
-        await wait_msg.edit_text(f"❌ Помилка:\n{str(e)[:300]}")
-
-
-async def _startup_screenshot():
-    try:
-        await _run_screenshot()
-        logging.info("Startup screenshot ready")
-    except Exception as e:
-        logging.error("Startup screenshot failed: %s", e, exc_info=True)
-
-
-async def scheduled_update():
-    logging.info("Scheduled screenshot update started")
-    try:
-        await _run_screenshot()
-        mtime_str = datetime.now().strftime("%d.%m.%Y %H:%M")
-        caption = f"Курси валют Приватбанку 📊 (архів)\n🕐 Автооновлення: {mtime_str}"
-        for chat_id in {ALLOWED_CHAT_ID, OWNER_CHAT_ID}:
-            if chat_id:
-                with contextlib.suppress(Exception):
-                    await bot.send_photo(
-                        chat_id, types.FSInputFile(SCREENSHOT_PATH), caption=caption
-                    )
-    except Exception as e:
-        logging.error("Scheduled update error: %s", e, exc_info=True)
+        logging.exception("cmd_rates failed")
+        await wait.edit_text(f"❌ Помилка: `{str(e)[:200]}`")
 
 
 async def main():
-    asyncio.create_task(_startup_screenshot())
-
-    try:
-        scheduler = AsyncIOScheduler()
-        for hour in [6, 12, 15, 18, 21, 0]:
-            scheduler.add_job(scheduled_update, "cron", hour=hour, minute=0)
-        scheduler.start()
-        logging.info("Scheduler started successfully")
-    except Exception as e:
-        logging.error("Scheduler failed to start: %s", e, exc_info=True)
-
     await dp.start_polling(bot, drop_pending_updates=True)
 
 
