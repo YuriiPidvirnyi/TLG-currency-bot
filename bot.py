@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import logging
 import os
@@ -13,7 +14,8 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import BotCommand
+from aiogram.types import BotCommand, BufferedInputFile
+from PIL import Image, ImageDraw, ImageFont
 
 logging.basicConfig(level=logging.INFO)
 
@@ -126,23 +128,84 @@ def _format_live(live: dict, currency: str) -> str:
     return "\n".join(lines)
 
 
-def _format_archive(rows: list, label: str, currency: str) -> str:
-    if not rows:
-        return f"❌ Архів порожній ({label})."
-    total = len(rows)
-    cropped = rows[:MAX_TG_ROWS]
-    lines = [
-        f"📊 *Архів {currency}/UAH • {label}*",
-        f"_Записів: {total}{' (показано перші ' + str(len(cropped)) + ')' if total > len(cropped) else ''}_",
-        "",
-        "```",
-        f"{'Дата':<11} {'Час':<9} {'Купівля':>8}  {'Продаж':>8}",
-        "─" * 41,
-    ]
-    for date, t, _cur, buy, sell in cropped:
-        lines.append(f"{date:<11} {t:<9} {buy:>8.4f}  {sell:>8.4f}")
-    lines.append("```")
-    return "\n".join(lines)
+_FONT_REG = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+)
+_FONT_BOLD = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+)
+
+
+def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
+    for p in (_FONT_BOLD if bold else _FONT_REG):
+        try:
+            return ImageFont.truetype(p, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _render_archive_png(rows: list, subtitle: str, currency: str) -> bytes:
+    PB_GREEN = "#0ba373"
+    HEADER_BG = "#f4f5f7"
+    BORDER = "#e1e4e8"
+    ROW_ALT = "#fafbfc"
+    TEXT = "#1f2d3d"
+    SUBTLE = "#6a7280"
+    BUY = "#1e7e34"
+    SELL = "#c0392b"
+
+    title_font = _font(28, bold=True)
+    subtitle_font = _font(14)
+    head_font = _font(16, bold=True)
+    cell_font = _font(16)
+    cell_bold = _font(16, bold=True)
+
+    cols = [("Дата", 150), ("Час", 110), ("Купівля", 130), ("Продаж", 130)]
+    pad = 24
+    width = pad * 2 + sum(w for _, w in cols)
+    title_h, sub_h, head_h, row_h = 44, 24, 50, 42
+    height = pad + title_h + sub_h + 16 + head_h + row_h * len(rows) + pad
+
+    img = Image.new("RGB", (width, height), "white")
+    d = ImageDraw.Draw(img)
+
+    d.rectangle([(0, 0), (width, 6)], fill=PB_GREEN)
+    d.text((pad, pad), f"{currency}/UAH • Архів", fill=TEXT, font=title_font)
+    d.text((pad, pad + title_h), subtitle, fill=SUBTLE, font=subtitle_font)
+
+    y = pad + title_h + sub_h + 16
+    d.rectangle([(pad, y), (width - pad, y + head_h)], fill=HEADER_BG)
+    x = pad + 12
+    for name, w in cols:
+        d.text((x, y + 16), name, fill=TEXT, font=head_font)
+        x += w
+    d.line([(pad, y + head_h), (width - pad, y + head_h)], fill=BORDER, width=1)
+    y += head_h
+
+    for i, (date, t, _cur, buy, sell) in enumerate(rows):
+        if i % 2 == 0:
+            d.rectangle([(pad, y), (width - pad, y + row_h)], fill=ROW_ALT)
+        x = pad + 12
+        cells = [
+            (date, TEXT, cell_font),
+            (t, SUBTLE, cell_font),
+            (f"{buy:.4f}", BUY, cell_bold),
+            (f"{sell:.4f}", SELL, cell_bold),
+        ]
+        for (val, color, font), (_, w) in zip(cells, cols):
+            d.text((x, y + 12), val, fill=color, font=font)
+            x += w
+        d.line([(pad, y + row_h), (width - pad, y + row_h)], fill=BORDER, width=1)
+        y += row_h
+
+    d.rectangle([(0, 0), (width - 1, height - 1)], outline=BORDER, width=1)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 @dp.message(Command("start"))
@@ -174,7 +237,19 @@ async def _reply_archive(message: types.Message, period: str, today_only: bool =
         if today_only:
             today = datetime.now().strftime("%d-%m-%Y")
             rows = [r for r in rows if r[0] == today]
-        await wait.edit_text(_format_archive(rows, label, DEFAULT_CURRENCY))
+        if not rows:
+            await wait.edit_text(f"❌ Архів порожній ({label}).")
+            return
+        cropped = rows[:MAX_TG_ROWS]
+        ts = datetime.now().strftime("%d.%m.%Y %H:%M")
+        suffix = f" (показано перші {len(cropped)})" if len(rows) > len(cropped) else ""
+        subtitle = f"{label} • згенеровано {ts} • {len(rows)} записів{suffix}"
+        png = await asyncio.to_thread(_render_archive_png, cropped, subtitle, DEFAULT_CURRENCY)
+        await bot.delete_message(message.chat.id, wait.message_id)
+        await message.answer_photo(
+            BufferedInputFile(png, filename=f"rates_{period}.png"),
+            caption=f"📊 *Архів {DEFAULT_CURRENCY}/UAH • {label}*",
+        )
     except Exception as e:
         logging.exception("archive %s failed", period)
         await wait.edit_text(f"❌ Помилка: `{str(e)[:200]}`")
