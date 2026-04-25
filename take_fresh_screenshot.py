@@ -4,7 +4,7 @@
 import asyncio
 from playwright.async_api import async_playwright
 
-OUTPUT_PATH = "/home/user/workspace/privatbank_rates.png"
+OUTPUT_PATH = "/app/privatbank_rates.png"
 
 
 async def main():
