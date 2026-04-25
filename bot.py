@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import os
 import logging
 from datetime import datetime
@@ -9,7 +10,6 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-# Guard against empty-string env vars (Railway can set vars to "")
 ALLOWED_CHAT_ID = int(os.environ.get("ALLOWED_CHAT_ID") or "0")
 OWNER_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID") or "0")
 
@@ -18,6 +18,44 @@ dp = Dispatcher()
 
 SCREENSHOT_PATH = "/app/privatbank_rates.png"
 SCREENSHOT_SCRIPT = "/app/take_fresh_screenshot.py"
+
+
+def _progress_bar(step: int, total: int, desc: str) -> str:
+    filled = round(step / total * 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    pct = round(step / total * 100)
+    return f"🔄 Оновлюю курси...\n\n{bar}  {pct}%\n📍 {desc}"
+
+
+async def _run_screenshot(progress_cb=None) -> None:
+    proc = await asyncio.create_subprocess_exec(
+        "python3", SCREENSHOT_SCRIPT,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    async def _read_stdout():
+        async for raw in proc.stdout:
+            text = raw.decode().strip()
+            if progress_cb and text.startswith("STEP:"):
+                parts = text.split(":", 3)
+                if len(parts) == 4:
+                    with contextlib.suppress(Exception):
+                        await progress_cb(int(parts[1]), int(parts[2]), parts[3])
+
+    try:
+        _, stderr_bytes = await asyncio.wait_for(
+            asyncio.gather(_read_stdout(), proc.stderr.read()),
+            timeout=120,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise
+
+    await proc.wait()
+    if proc.returncode != 0:
+        raise Exception(stderr_bytes.decode()[:500])
 
 
 @dp.message(Command("start"))
@@ -30,7 +68,7 @@ async def cmd_start(message: types.Message):
         "Надсилаю архів курсів валют Приватбанку.\n\n"
         "Команди:\n"
         "/rates — останній збережений скрін 📊\n"
-        "/refresh — свіжий скрін просто зараз 🔄 (~1-2 хв)\n"
+        "/refresh — свіжий скрін просто зараз 🔄 (~20 сек)\n"
         "/start — це повідомлення\n\n"
         "🕐 Автооновлення: 06:00, 12:00, 15:00, 18:00, 21:00, 00:00"
     )
@@ -51,19 +89,8 @@ async def cmd_rates(message: types.Message):
 
     await message.answer_photo(
         types.FSInputFile(SCREENSHOT_PATH),
-        caption=f"Архів курсів валют Приватбанку 📊\n🕐 Оновлено: {updated}"
+        caption=f"Архів курсів валют Приватбанку 📊\n🕐 Оновлено: {updated}",
     )
-
-
-async def _run_screenshot() -> None:
-    proc = await asyncio.create_subprocess_exec(
-        "python3", SCREENSHOT_SCRIPT,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
-    if proc.returncode != 0:
-        raise Exception(stderr.decode()[:300])
 
 
 @dp.message(Command("refresh"))
@@ -72,21 +99,27 @@ async def cmd_refresh(message: types.Message):
         await message.answer("Вибач, цей бот лише для особистого використання.")
         return
 
-    wait_msg = await message.answer("⏳ Роблю свіжий скрін... Зачекай ~1-2 хв.")
+    wait_msg = await message.answer(
+        "🔄 Оновлюю курси...\n\n░░░░░░░░░░  0%\n📍 Запускаю..."
+    )
+
+    async def on_progress(step: int, total: int, desc: str) -> None:
+        with contextlib.suppress(Exception):
+            await wait_msg.edit_text(_progress_bar(step, total, desc))
 
     try:
-        await _run_screenshot()
+        await _run_screenshot(progress_cb=on_progress)
         await bot.delete_message(message.chat.id, wait_msg.message_id)
-        mtime_str = datetime.now().strftime('%d.%m.%Y %H:%M')
+        mtime_str = datetime.now().strftime("%d.%m.%Y %H:%M")
         await message.answer_photo(
             types.FSInputFile(SCREENSHOT_PATH),
-            caption=f"Курси валют Приватбанку 📊 (архів)\n🔄 Щойно оновлено: {mtime_str}"
+            caption=f"Курси валют Приватбанку 📊 (архів)\n🔄 Щойно оновлено: {mtime_str}",
         )
     except asyncio.TimeoutError:
-        await wait_msg.edit_text("❌ Час очікування вичерпано. Спробуй ще раз.")
+        await wait_msg.edit_text("❌ Час очікування вичерпано (>2 хв). Спробуй ще раз.")
     except Exception as e:
-        logging.error(f"Refresh error: {e}", exc_info=True)
-        await wait_msg.edit_text(f"❌ Помилка: {str(e)[:200]}")
+        logging.error("Refresh error: %s", e, exc_info=True)
+        await wait_msg.edit_text(f"❌ Помилка:\n{str(e)[:300]}")
 
 
 async def _startup_screenshot():
@@ -94,23 +127,23 @@ async def _startup_screenshot():
         await _run_screenshot()
         logging.info("Startup screenshot ready")
     except Exception as e:
-        logging.error(f"Startup screenshot failed: {e}", exc_info=True)
+        logging.error("Startup screenshot failed: %s", e, exc_info=True)
 
 
 async def scheduled_update():
     logging.info("Scheduled screenshot update started")
     try:
         await _run_screenshot()
-        mtime_str = datetime.now().strftime('%d.%m.%Y %H:%M')
+        mtime_str = datetime.now().strftime("%d.%m.%Y %H:%M")
         caption = f"Курси валют Приватбанку 📊 (архів)\n🕐 Автооновлення: {mtime_str}"
         for chat_id in {ALLOWED_CHAT_ID, OWNER_CHAT_ID}:
             if chat_id:
-                try:
-                    await bot.send_photo(chat_id, types.FSInputFile(SCREENSHOT_PATH), caption=caption)
-                except Exception as e:
-                    logging.error(f"Failed to send scheduled update to {chat_id}: {e}")
+                with contextlib.suppress(Exception):
+                    await bot.send_photo(
+                        chat_id, types.FSInputFile(SCREENSHOT_PATH), caption=caption
+                    )
     except Exception as e:
-        logging.error(f"Scheduled update error: {e}", exc_info=True)
+        logging.error("Scheduled update error: %s", e, exc_info=True)
 
 
 async def main():
@@ -123,8 +156,7 @@ async def main():
         scheduler.start()
         logging.info("Scheduler started successfully")
     except Exception as e:
-        # Scheduler failure must not prevent the bot from starting
-        logging.error(f"Scheduler failed to start: {e}", exc_info=True)
+        logging.error("Scheduler failed to start: %s", e, exc_info=True)
 
     await dp.start_polling(bot, drop_pending_updates=True)
 
