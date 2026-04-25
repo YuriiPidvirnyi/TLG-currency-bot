@@ -55,7 +55,10 @@ async def _run_screenshot(progress_cb=None) -> None:
 
     await proc.wait()
     if proc.returncode != 0:
-        raise Exception(stderr_bytes.decode()[:500])
+        err = stderr_bytes.decode().strip()
+        # Show last 5 lines — that's where the actual exception type/message lives
+        last = "\n".join(err.splitlines()[-5:])
+        raise Exception(last)
 
 
 @dp.message(Command("start"))
