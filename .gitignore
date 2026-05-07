@@ -6,6 +6,7 @@ venv/
 .env
 *.log
 *.png
+!assets/**/*.png
 *.db
 *.db-journal
 data/

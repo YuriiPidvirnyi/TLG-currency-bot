@@ -59,7 +59,7 @@ async def cmd_preview(message: types.Message, user: User, db: Database, config: 
         await message.answer("Немає відкритого циклу.")
         return
     xlsx, pdf, summary = await reports_service.generate_report(
-        db, cycle.id, config.clinic_name, config.reports_dir
+        db, cycle.id, config.clinic_name, config.reports_dir, config.assets_dir
     )
     await message.answer(summary, parse_mode="Markdown")
     await message.answer_document(types.FSInputFile(str(xlsx)))
@@ -85,7 +85,7 @@ async def cmd_close(message: types.Message, user: User, db: Database, config: Co
         return
 
     xlsx, pdf, summary = await reports_service.generate_report(
-        db, cycle.id, config.clinic_name, config.reports_dir
+        db, cycle.id, config.clinic_name, config.reports_dir, config.assets_dir
     )
     await reports_service.save_report_record(db, cycle.id, xlsx, pdf, summary)
     await cycles.close_cycle(db, cycle.id, closed_by_user_id=user.id)

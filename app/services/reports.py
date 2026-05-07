@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 from openpyxl import Workbook
+from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Font, PatternFill
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -13,6 +14,7 @@ from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
+    Image as RLImage,
     Paragraph,
     SimpleDocTemplate,
     Spacer,
@@ -21,6 +23,10 @@ from reportlab.platypus import (
 )
 
 from app.db import Database
+
+
+BRAND_BLUE = "#AECED3"
+BRAND_TEXT_DARK = "#1F2D3D"
 
 log = logging.getLogger(__name__)
 
@@ -143,11 +149,16 @@ def _summary_text(clinic_name: str, cycle_id: int, opened_at: str, rows: list[Ag
 
 
 def _build_xlsx(
-    clinic_name: str, cycle_id: int, opened_at: str, rows: list[AggregatedRow], path: Path
+    clinic_name: str,
+    cycle_id: int,
+    opened_at: str,
+    rows: list[AggregatedRow],
+    path: Path,
+    logo_path: Path | None = None,
 ) -> None:
     wb = Workbook()
-    header_font = Font(bold=True, color="FFFFFF")
-    header_fill = PatternFill("solid", fgColor="0BA373")
+    header_font = Font(bold=True, color=BRAND_TEXT_DARK.lstrip("#"))
+    header_fill = PatternFill("solid", fgColor=BRAND_BLUE.lstrip("#"))
     center = Alignment(horizontal="center", vertical="center")
     wrap = Alignment(wrap_text=True, vertical="top")
 
@@ -187,6 +198,27 @@ def _build_xlsx(
     summary.title = "Зведено"
     write_sheet(summary, rows, include_cabinet=True)
 
+    # Brand header on the summary sheet only: 4 blank rows + title + logo anchored at A1
+    summary.insert_rows(1, amount=4)
+    for r in range(1, 5):
+        summary.row_dimensions[r].height = 22
+    summary.cell(row=2, column=2, value=clinic_name).font = Font(
+        bold=True, size=18, color=BRAND_TEXT_DARK.lstrip("#")
+    )
+    summary.cell(
+        row=3,
+        column=2,
+        value=f"Замовлення витратних матеріалів • цикл #{cycle_id} • "
+        f"{datetime.now().strftime('%Y-%m-%d')}",
+    ).font = Font(size=10, color="6A7280")
+    if logo_path and logo_path.exists():
+        try:
+            img = XLImage(str(logo_path))
+            img.width, img.height = 110, 88
+            summary.add_image(img, "A1")
+        except Exception as e:
+            log.warning("Failed to embed XLSX logo: %s", e)
+
     by_cabinet: dict[str, list[AggregatedRow]] = defaultdict(list)
     for r in rows:
         by_cabinet[r.cabinet_name].append(r)
@@ -215,7 +247,12 @@ def _build_xlsx(
 
 
 def _build_pdf(
-    clinic_name: str, cycle_id: int, opened_at: str, rows: list[AggregatedRow], path: Path
+    clinic_name: str,
+    cycle_id: int,
+    opened_at: str,
+    rows: list[AggregatedRow],
+    path: Path,
+    logo_path: Path | None = None,
 ) -> None:
     font = _ensure_pdf_font()
     doc = SimpleDocTemplate(
@@ -237,7 +274,16 @@ def _build_pdf(
     )
     body = ParagraphStyle("Body", parent=styles["Normal"], fontName=font, fontSize=10, leading=12)
 
-    story = [
+    story = []
+    if logo_path and logo_path.exists():
+        try:
+            logo = RLImage(str(logo_path), width=28 * mm, height=22 * mm)
+            logo.hAlign = "LEFT"
+            story.append(logo)
+            story.append(Spacer(1, 3 * mm))
+        except Exception as e:
+            log.warning("Failed to embed PDF logo: %s", e)
+    story += [
         Paragraph(f"{clinic_name}", title_style),
         Paragraph(f"Замовлення витратних матеріалів — цикл #{cycle_id}", body),
         Paragraph(
@@ -265,8 +311,8 @@ def _build_pdf(
             ])
         t = Table(data, colWidths=[10 * mm, 70 * mm, 15 * mm, 12 * mm, 32 * mm, 41 * mm], repeatRows=1)
         t.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0BA373")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(BRAND_BLUE)),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor(BRAND_TEXT_DARK)),
             ("FONTNAME", (0, 0), (-1, 0), f"{font}-Bold"),
             ("FONTNAME", (0, 1), (-1, -1), font),
             ("FONTSIZE", (0, 0), (-1, -1), 9),
@@ -293,6 +339,7 @@ async def generate_report(
     cycle_id: int,
     clinic_name: str,
     reports_dir: Path,
+    assets_dir: Path | None = None,
 ) -> tuple[Path, Path, str]:
     cur = await db.conn.execute(
         "SELECT opened_at FROM order_cycles WHERE id = ?", (cycle_id,)
@@ -309,8 +356,10 @@ async def generate_report(
     xlsx_path = out_dir / f"order_{cycle_id}_{stamp}.xlsx"
     pdf_path = out_dir / f"order_{cycle_id}_{stamp}.pdf"
 
-    _build_xlsx(clinic_name, cycle_id, opened_at, rows, xlsx_path)
-    _build_pdf(clinic_name, cycle_id, opened_at, rows, pdf_path)
+    logo_color = (assets_dir / "brand" / "logo.png") if assets_dir else None
+    logo_bw = (assets_dir / "brand" / "logo-bw.png") if assets_dir else None
+    _build_xlsx(clinic_name, cycle_id, opened_at, rows, xlsx_path, logo_path=logo_color)
+    _build_pdf(clinic_name, cycle_id, opened_at, rows, pdf_path, logo_path=logo_bw)
 
     return xlsx_path, pdf_path, summary
 

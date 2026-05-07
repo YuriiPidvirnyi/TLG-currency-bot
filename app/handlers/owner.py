@@ -23,7 +23,7 @@ async def cmd_report(message: types.Message, user: User, db: Database, config: C
         await message.answer("Немає відкритого циклу.")
         return
     xlsx, pdf, summary = await reports_service.generate_report(
-        db, cycle.id, config.clinic_name, config.reports_dir
+        db, cycle.id, config.clinic_name, config.reports_dir, config.assets_dir
     )
     await message.answer(summary, parse_mode="Markdown")
     await message.answer_document(types.FSInputFile(str(xlsx)))

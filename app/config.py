@@ -14,6 +14,7 @@ class Config:
     reminder_cron: str
     tz: str
     migrations_dir: Path
+    assets_dir: Path
 
 
 def load_config() -> Config:
@@ -26,10 +27,11 @@ def load_config() -> Config:
         bot_token=os.environ["BOT_TOKEN"],
         admin_chat_id=int(os.environ.get("ADMIN_CHAT_ID") or "0"),
         owner_chat_id=int(os.environ.get("OWNER_CHAT_ID") or "0"),
-        clinic_name=os.environ.get("CLINIC_NAME", "Стоматологічна клініка"),
+        clinic_name=os.environ.get("CLINIC_NAME", "Dental Story"),
         db_path=db_path,
         reports_dir=reports_dir,
         reminder_cron=os.environ.get("REMINDER_CRON", "0 16 * * 5"),
         tz=os.environ.get("TZ", "Europe/Kyiv"),
         migrations_dir=Path(__file__).resolve().parent.parent / "migrations",
+        assets_dir=Path(__file__).resolve().parent.parent / "assets",
     )
