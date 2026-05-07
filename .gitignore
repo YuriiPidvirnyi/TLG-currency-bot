@@ -6,6 +6,10 @@ venv/
 .env
 *.log
 *.png
+*.db
+*.db-journal
+data/
+reports/
 .DS_Store
 .idea/
 .vscode/

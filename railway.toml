@@ -3,3 +3,7 @@ builder = "dockerfile"
 
 [deploy]
 restartPolicyType = "always"
+
+[[deploy.volumes]]
+mountPath = "/data"
+name = "clinic-data"
